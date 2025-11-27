@@ -1,0 +1,50 @@
+body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    font-family: 'Geist', sans-serif;
+    background: white;
+    margin: 0;
+    overflow: hidden;
+}
+
+#canvasContainer {
+    position: relative;
+    /* size set inline from JS */
+    border: 0;
+}
+
+#canvasContainer > pre {
+    margin: 0;
+    font-weight: 900;
+    font-family: 'Geist', monospace;
+    font-size: 1em !important;
+    text-shadow: 0 0 1px #000, 0 0 1px #000, 1px 0 0 #000, 0 1px 0 #000;
+    /* we scale via transform */
+}
+
+.corner-label {
+    position: absolute;
+    color: black;
+    font-size: 0.9rem;
+    letter-spacing: 0.05em;
+    user-select: none;
+    pointer-events: none;
+}
+
+.top-left { top: 4px; left: 6px; }
+.top-right { top: 4px; right: 6px; text-align: right; font-size: 2.7rem; line-height: 1; transform: translateY(-18px); }
+.bottom-left { bottom: 4px; left: 6px; }
+.bottom-right { bottom: 4px; right: 6px; text-align: right; }
+.model-switcher {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.model-arrow {
+    cursor: pointer;
+    font-weight: bold;
+    pointer-events: auto;
+    user-select: none;
+}
