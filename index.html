@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Duck ASCII Viewer</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <link type="text/css" rel="stylesheet" href="main.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- MediaPipe Hands and Camera Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin></script>
+
+    <script type="module">
+        import * as THREE from 'https://unpkg.com/three@0.178.0/build/three.module.js';
+        import { AsciiEffect } from 'https://unpkg.com/three@0.178.0/examples/jsm/effects/AsciiEffect.js?module';
+        import { OrbitControls } from 'https://unpkg.com/three@0.178.0/examples/jsm/controls/OrbitControls.js?module';
+        import { GLTFLoader } from 'https://unpkg.com/three@0.178.0/examples/jsm/loaders/GLTFLoader.js?module';
+        import { setThreeJsObjects, onResults } from './handControls.js';
+        
+        let camera, controls, scene, renderer, effect;
+        let mixer, eyeModel;
+        let canvasContainer;
+        let bottomLeftClock;
+        let handsCanvas, handsCanvasCtx;
+        let leftHandPinch = false;
+        let rightHandPinch = false;
+        let lastLeftHandY = null;
+        let scaleFactor = 1.8; // Higher default ASCII density (1 = original)
+        const minScaleFactor = 0.5;
+        const maxScaleFactor = 3.0;
+        let lastDensityUpdate = 0; // For throttling updates
+        const clock = new THREE.Clock();
+        // Model and animation state
+        const modelNames = ['duck', 'frog', 'rat', 'doge', 'catspin', 'fidgetspinner'];
+        let currentModelIndex = 0;
+        let currentModelName = modelNames[currentModelIndex];
+        let modelLoadVersion = 0;
+        let duckAnimations = { walk: null };
+        let frogAnimations = { jump: null };
+        let ratAnimations = { walkDefault: null, walkStart: null, walkEnd: null, idle: null };
+        let dogeAnimations = { sitting: null, playDead: null };
+        let catAnimations = { spin: null };
+        let catColorInterval = null;
+        let fidgetSpinnerAnimations = { spin: null };
+        // Helper to clear rat actions
+        function stopAllRatActions() {
+            Object.values(ratAnimations).forEach(action => {
+                if (action) action.stop();
+            });
+        }
+        let isJumping = false;
+        let jumpStartTime = 0;
+        const jumpDuration = 1000;
+        let lastPointerOnModel = false;
+        
+        // New global variable declarations near other globals
+        let pointerOnModel = false;
+        const pointerSpeedMultiplier = 2; // reduced speed up factor when pointer on model
+        let baseRotationSpeed = 0.3; // higher normal auto-rotation speed for more visible difference
+        let scrollSpeed = 0; // additional speed modifier from scroll gestures
+        let lastRightHandZ = null;
+        let pokeState = { active: false, time: 0, duration: 300 };
+        // Helper to apply current scaleFactor
+        function updateAsciiScale() {
+            if (!effect || !canvasContainer) return;
+            const rect = canvasContainer.getBoundingClientRect();
+            effect.setSize(rect.width * scaleFactor, rect.height * scaleFactor);
+            effect.domElement.style.transform = `translate(-50%, -50%) scale(${1 / scaleFactor})`;
+        }
+
+        // Easy customization: Change this number to adjust character density
+        // Higher numbers = more characters (more detail)
+        // Lower numbers = fewer characters (less detail)
+        const baseCharacterDensity = 50000; // Even higher density for more detail
+
+        init();
+
+        // After Three.js is initialized, connect controls/camera to hand tracking and start it
+        // setThreeJsObjects(controls, camera); // Moved to init()
+        setupHandTracking();
+
+        function setupHandTracking() {
+            // Hidden video element for webcam feed
+            const videoElement = document.createElement('video');
+            videoElement.style.display = 'none';
+            videoElement.playsInline = true;
+            document.body.appendChild(videoElement);
+
+            // Initialize MediaPipe Hands
+            const mpHands = new window.Hands({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            });
+
+            mpHands.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.7
+            });
+
+            mpHands.onResults(handResults);
+
+            // Use MediaPipe Camera helper
+            const cameraFeed = new Camera(videoElement, {
+                onFrame: async () => {
+                    await mpHands.send({ image: videoElement });
+                },
+                width: 640,
+                height: 480
+            });
+
+            cameraFeed.start();
+        }
+
+        function handResults(results) {
+            // Call original onResults for camera control and get hand states
+            const handStates = onResults(results);
+            rightHandPinch = handStates ? handStates.rightHandPinch : false;
+
+            // Handle left hand pinch for ASCII density control
+            let leftLandmarks, rightLandmarks;
+            if (results.multiHandedness && results.multiHandLandmarks) {
+                results.multiHandedness.forEach((handInfo, i) => {
+                    if (handInfo.label === 'Right') leftLandmarks = results.multiHandLandmarks[i];
+                    if (handInfo.label === 'Left') rightLandmarks = results.multiHandLandmarks[i];
+                });
+            }
+
+            const isLeftPinching = isPinching(leftLandmarks);
+            const prevLeftPinch = leftHandPinch;
+            leftHandPinch = isLeftPinching;
+
+            // Detect if right hand pointer (index tip) is over the model (center of screen)
+            if (rightLandmarks && rightLandmarks[8]) {
+                const tip = rightLandmarks[8];
+                // Convert normalized coordinates to actual canvas coordinates
+                const canvasRect = canvasContainer.getBoundingClientRect();
+                const canvasX = tip.x * canvasRect.width;
+                const canvasY = tip.y * canvasRect.height;
+                
+                // Check if pointer is within the canvas bounds
+                const inCanvas = canvasX >= 0 && canvasX <= canvasRect.width && 
+                                canvasY >= 0 && canvasY <= canvasRect.height;
+                
+                // Check if pointer is near the center of the canvas (where the duck is)
+                const centerX = canvasRect.width / 2;
+                const centerY = canvasRect.height / 2;
+                const dx = canvasX - centerX;
+                const dy = canvasY - centerY;
+                const dist = Math.hypot(dx, dy);
+                const threshold = Math.min(canvasRect.width, canvasRect.height) * 0.2; // 20% of smaller dimension
+                
+                pointerOnModel = inCanvas && dist < threshold;
+                if (currentModelName === 'doge') {
+                    console.log('Doge pointer on model:', pointerOnModel, 'dist:', dist, 'threshold:', threshold);
+                }
+                if (currentModelName === 'frog') {
+                    if (pointerOnModel && !lastPointerOnModel && !isJumping && frogAnimations.jump) {
+                        triggerJump();
+                    }
+                    lastPointerOnModel = pointerOnModel;
+                } else if (currentModelName === 'rat') {
+                    if (pointerOnModel && !lastPointerOnModel) {
+                        ratPointerEnter();
+                    } else if (!pointerOnModel && lastPointerOnModel) {
+                        ratPointerLeave();
+                    }
+                    lastPointerOnModel = pointerOnModel;
+                } else if (currentModelName === 'doge') {
+                    // No special pointer hover behaviour for Doge
+                    lastPointerOnModel = pointerOnModel;
+                } else if (currentModelName === 'catspin') {
+                    if (pointerOnModel && !catAnimations.spin.isRunning()) {
+                        catAnimations.spin.play();
+                        startCatColorChange();
+                    } else if (!pointerOnModel && catAnimations.spin.isRunning()) {
+                        catAnimations.spin.stop();
+                        stopCatColorChange();
+                    }
+                    lastPointerOnModel = pointerOnModel;
+                } else if (currentModelName === 'fidgetspinner') {
+                    if (pointerOnModel && fidgetSpinnerAnimations.spin && !fidgetSpinnerAnimations.spin.isRunning()) {
+                        fidgetSpinnerAnimations.spin.play();
+                    } else if (!pointerOnModel && fidgetSpinnerAnimations.spin && fidgetSpinnerAnimations.spin.isRunning()) {
+                        fidgetSpinnerAnimations.spin.stop();
+                    }
+                    lastPointerOnModel = pointerOnModel;
+                }
+                
+                // Poke detection logic for duck, doge, and cat
+                if (currentModelName === 'duck' || currentModelName === 'doge' || currentModelName === 'catspin') {
+                    const currentZ = tip.z;
+                    if (lastRightHandZ !== null && pointerOnModel) {
+                        const dz = currentZ - lastRightHandZ;
+                        // z decreases as the hand moves towards the camera/screen
+                        const pokeThreshold = currentModelName === 'doge' ? -0.015 : (currentModelName === 'catspin' ? -0.025 : -0.03); // Different thresholds
+                        if (dz < pokeThreshold) { // Threshold for poke detection (fast forward movement)
+                            console.log('Poke detected for', currentModelName, 'dz:', dz, 'threshold:', pokeThreshold);
+                            triggerPoke();
+                        }
+                    }
+                    lastRightHandZ = currentZ;
+                }
+            } else {
+                pointerOnModel = false;
+                lastRightHandZ = null;
+                lastPointerOnModel = false;
+            }
+
+            // Debug logging
+            console.log('Left hand pinching:', isLeftPinching, 'Right hand pinching:', rightHandPinch);
+
+            // ASCII density control with left hand pinch and vertical movement
+            if (leftHandPinch && !rightHandPinch) {
+                const curr = leftLandmarks[8]; // Index finger tip
+                if (prevLeftPinch && lastLeftHandY !== null) {
+                    const dy = lastLeftHandY - curr.y; // Positive when moving up
+                    console.log('Hand movement dy:', dy);
+                    updateAsciiDensity(dy);
+                }
+                lastLeftHandY = curr.y;
+            } else {
+                lastLeftHandY = null;
+            }
+
+            // Draw hand landmarks
+            handsCanvasCtx.save();
+            handsCanvasCtx.clearRect(0, 0, handsCanvas.width, handsCanvas.height);
+
+            if (results.multiHandLandmarks) {
+                // Flip the canvas horizontally for a mirror effect
+                handsCanvasCtx.translate(handsCanvas.width, 0);
+                handsCanvasCtx.scale(-1, 1);
+
+                const isDark = document.body.style.background === 'black';
+
+                for (const landmarks of results.multiHandLandmarks) {
+                    window.drawConnectors(handsCanvasCtx, landmarks, window.HAND_CONNECTIONS, {
+                        color: isDark ? '#FFFFFF' : '#000000',
+                        lineWidth: 2
+                    });
+                    window.drawLandmarks(handsCanvasCtx, landmarks, {
+                        color: isDark ? '#CCCCCC' : '#333333',
+                        lineWidth: 1,
+                        radius: 3
+                    });
+                }
+            }
+            handsCanvasCtx.restore();
+        }
+
+        function triggerPoke() {
+            if (currentModelName === 'catspin') {
+                if (catAnimations.spin && catAnimations.spin.isRunning()) {
+                    const originalSpeed = 1.0;
+                    catAnimations.spin.setEffectiveTimeScale(originalSpeed * 3); // Speed up
+                    setTimeout(() => {
+                        if (catAnimations.spin) catAnimations.spin.setEffectiveTimeScale(originalSpeed); // Reset speed
+                    }, 500); // For 0.5 seconds
+                }
+                return;
+            }
+            // Special handling for doge – allow repeated pokes as long as play_dead is not running
+            if (currentModelName === 'doge') {
+                console.log('Doge poke triggered');
+                if (!dogeAnimations.playDead || !mixer) {
+                    console.log('Doge animations not ready');
+                    return;
+                }
+
+                // Check if play_dead is currently running by checking if it's the active action
+                const isPlayDeadRunning = dogeAnimations.playDead.isRunning && dogeAnimations.playDead.isRunning();
+                console.log('Play dead running:', isPlayDeadRunning);
+                
+                if (isPlayDeadRunning) {
+                    console.log('Play dead already running, ignoring poke');
+                    return;
+                }
+
+                console.log('Playing dead animation');
+                // Ensure sitting stops
+                if (dogeAnimations.sitting) dogeAnimations.sitting.stop();
+
+                // Play play_dead once
+                dogeAnimations.playDead.reset().play();
+
+                const onFinished = (e) => {
+                    if (e.action === dogeAnimations.playDead) {
+                        console.log('Play dead finished, returning to sitting');
+                        mixer.removeEventListener('finished', onFinished);
+                        if (currentModelName === 'doge' && dogeAnimations.sitting) {
+                            dogeAnimations.playDead.stop();
+                            dogeAnimations.sitting.reset().play();
+                        }
+                    }
+                };
+                mixer.addEventListener('finished', onFinished);
+                return;
+            }
+
+            // Default (duck) behaviour with debounce via pokeState
+            if (pokeState.active) return;
+
+            pokeState.active = true;
+            pokeState.time = Date.now();
+
+            console.log('Poke!');
+        }
+        function triggerJump() {
+            if (!frogAnimations.jump || isJumping) return;
+            isJumping = true;
+            jumpStartTime = Date.now();
+            frogAnimations.jump.reset().play();
+        }
+        function updateJumpAnimation() {
+            if (!isJumping) return;
+            const elapsed = Date.now() - jumpStartTime;
+            if (elapsed >= jumpDuration) {
+                isJumping = false;
+                if (frogAnimations.jump) {
+                    frogAnimations.jump.stop();
+                }
+            }
+        }
+
+        function updateAsciiDensity(dy) {
+            const now = Date.now();
+            if (now - lastDensityUpdate < 60) return; // throttle ~16fps
+
+            const deltaPx = dy * 1500; // much higher sensitivity multiplier for faster changes
+            let newScaleFactor = scaleFactor + deltaPx / 100; // Adjust scaleFactor
+            newScaleFactor = Math.max(minScaleFactor, Math.min(maxScaleFactor, newScaleFactor));
+
+            if (newScaleFactor !== scaleFactor) {
+                scaleFactor = newScaleFactor;
+                lastDensityUpdate = now;
+
+                updateAsciiScale();
+
+                console.log('ASCII scale factor updated to:', scaleFactor);
+            }
+        }
+
+        function isPinching(landmarks) {
+            if (!landmarks) return false;
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            return getDistance(thumbTip, indexTip) < 0.05;
+        }
+
+        function getDistance(p1, p2) {
+            const dx = p1.x - p2.x;
+            const dy = p1.y - p2.y;
+            return Math.hypot(dx, dy);
+        }
+
+        function init() {
+            const maxWidth = window.innerWidth * 0.95;
+            const maxHeight = window.innerHeight * 0.8;
+            let canvasWidth = Math.min(maxWidth, maxHeight * 2);
+            let canvasHeight = canvasWidth / 2;
+            if (canvasHeight > maxHeight) {
+                canvasHeight = maxHeight;
+                canvasWidth = canvasHeight * 2;
+            }
+
+            camera = new THREE.PerspectiveCamera(70, canvasWidth / canvasHeight, 1, 5000);
+            camera.position.set(0, 150, 900);
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0, 0, 0);
+
+            const light1 = new THREE.PointLight(0xffffff, 2.5);
+            light1.position.set(500, 500, 500);
+            scene.add(light1);
+            
+            const light2 = new THREE.PointLight(0xffffff, 1.0);
+            light2.position.set(-500, -500, -500);
+            scene.add(light2);
+
+            const ambient = new THREE.AmbientLight(0xffffff, 0.1);
+            scene.add(ambient);
+
+            // Add more dramatic lighting for better shadows
+            const light3 = new THREE.PointLight(0xffffff, 2.0);
+            light3.position.set(0, 300, 200);
+            scene.add(light3);
+
+            const light4 = new THREE.PointLight(0xffffff, 1.5);
+            light4.position.set(-300, 200, -200);
+            scene.add(light4);
+
+            const light5 = new THREE.PointLight(0xffffff, 1.2);
+            light5.position.set(300, -200, 300);
+            scene.add(light5);
+
+            // Add colored lights for more dramatic effect
+            const redLight = new THREE.PointLight(0xff4444, 0.8);
+            redLight.position.set(400, 100, 400);
+            scene.add(redLight);
+
+            const blueLight = new THREE.PointLight(0x4444ff, 0.8);
+            blueLight.position.set(-400, 100, -400);
+            scene.add(blueLight);
+
+            // Add strong directional lights for dramatic shadows
+            const dirLight1 = new THREE.DirectionalLight(0xffffff, 3.0);
+            dirLight1.position.set(200, 400, 100);
+            scene.add(dirLight1);
+
+            const dirLight2 = new THREE.DirectionalLight(0xffffff, 2.0);
+            dirLight2.position.set(-200, 300, -100);
+            scene.add(dirLight2);
+
+            // Add spotlight effect
+            const spotLight = new THREE.SpotLight(0xffffff, 2.5);
+            spotLight.position.set(0, 500, 0);
+            spotLight.angle = Math.PI / 6;
+            spotLight.penumbra = 0.1;
+            spotLight.decay = 2;
+            spotLight.distance = 1000;
+            scene.add(spotLight);
+
+            loadModel(currentModelName);
+
+            renderer = new THREE.WebGLRenderer();
+            renderer.setSize(canvasWidth, canvasHeight);
+            renderer.setAnimationLoop(animate);
+            function loadModel(name) {
+                stopCatColorChange();
+                if (eyeModel) {
+                    scene.remove(eyeModel);
+                    eyeModel = null;
+                    mixer = null;
+                }
+                const thisLoadVersion = ++modelLoadVersion;
+                const loader = new GLTFLoader();
+
+                const modelConfig = {
+                    duck: { path: 'https://play.rosebud.ai/assets/duck.glb?EDoP', scaleMultiplier: 5.0 },
+                    frog: { path: 'https://play.rosebud.ai/assets/frog.glb?HPcC', scaleMultiplier: 6.0 },
+                    rat:  { path: 'https://play.rosebud.ai/assets/rat1.glb?EtIN', scaleMultiplier: 8.0 },
+                    doge: { path: 'https://play.rosebud.ai/assets/doge.glb?orBi', scaleMultiplier: 6.0 },
+                    catspin: { path: 'https://play.rosebud.ai/assets/catspin.glb?EzXX', scaleMultiplier: 12.0 },
+                    fidgetspinner: { path: 'https://play.rosebud.ai/assets/fidgetspinner.glb?rBf8', scaleMultiplier: 8.0 }
+                };
+
+                const config = modelConfig[name] || modelConfig.duck;
+                const modelPath = config.path;
+                const modelScaleMultiplier = config.scaleMultiplier;
+
+                const isDuck = name === 'duck';
+                const isFrog = name === 'frog';
+                const isRat = name === 'rat';
+                const isDoge = name === 'doge';
+                const isCat = name === 'catspin';
+                const isFidgetSpinner = name === 'fidgetspinner';
+                const attribution = isDuck ? '<!-- "Duck_Walk (Free)" (https://skfb.ly/owq7o) by Nyilonelycompany is licensed under CC BY 4.0 -->'
+                                    : isFrog ? '<!-- "Frog" (https://skfb.ly/6wIvC) by gooseg489 is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/). -->'
+                                    : isRat ? '<!-- "Black Rat ( Free download )" (https://skfb.ly/p9TYP) by Nestaeric is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/). -->'
+                                    : isDoge ? '<!-- "Animated Dog, Shiba Inu" (https://skfb.ly/6SrJO) by quander is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/). -->'
+                                    : isCat ? '<!-- "Cat Spin" (https://skfb.ly/oCzST) by Natalia is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/). -->'
+                                    : '<!-- "Fidget Spinner" (https://skfb.ly/6QXs6) by Anthony Yanez is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/). -->';
+                
+                loader.load(modelPath, (gltf) => {
+                    if (thisLoadVersion !== modelLoadVersion) return; // Skip if a newer load has occurred
+                    eyeModel = gltf.scene;
+                    const box = new THREE.Box3().setFromObject(eyeModel);
+                    const size = new THREE.Vector3();
+                    const center = new THREE.Vector3();
+                    box.getSize(size);
+                    box.getCenter(center);
+                    const maxDim = Math.max(size.x, size.y, size.z);
+                    const desiredSize = 150;
+                    const scale = desiredSize / maxDim;
+                    eyeModel.scale.setScalar(scale * modelScaleMultiplier);
+                    eyeModel.position.set(
+                        -center.x * scale * modelScaleMultiplier,
+                        -center.y * scale * modelScaleMultiplier,
+                        -center.z * scale * modelScaleMultiplier
+                    );
+                    eyeModel.originalPosition = eyeModel.position.clone();
+                    if (isFidgetSpinner) {
+                        const tiltAngle = 20 * (Math.PI / 180); // 20 degrees tilt
+                        eyeModel.rotation.x = tiltAngle;
+                    }
+                    eyeModel.traverse((child) => {
+                        if (child.isMesh) {
+                            if (child.material) {
+                                if (child.material.metalness !== undefined) {
+                                    child.material.metalness = 0.8;
+                                    child.material.roughness = 0.2;
+                                }
+                                child.material.needsUpdate = true;
+                            }
+                            child.castShadow = true;
+                            child.receiveShadow = true;
+                        }
+                    });
+                    scene.add(eyeModel);
+                    camera.lookAt(0, 0, 0);
+                    if (gltf.animations && gltf.animations.length) {
+                        mixer = new THREE.AnimationMixer(eyeModel);
+                        if (isDuck) {
+                            const walkAction = mixer.clipAction(gltf.animations.find(clip => clip.name === 'walk'));
+                            if (walkAction) {
+                                duckAnimations.walk = walkAction;
+                                duckAnimations.walk.setLoop(THREE.LoopRepeat, Infinity).play();
+                            }
+                        } else if (isFrog) {
+                            const jumpClip = gltf.animations.find(clip => clip.name.toLowerCase().includes('jump'));
+                            if (jumpClip) {
+                                frogAnimations.jump = mixer.clipAction(jumpClip);
+                                frogAnimations.jump.setLoop(THREE.LoopOnce, 1).clampWhenFinished = true;
+                            }
+                        } else if (isRat) {
+                            // Map rat animations
+                            const clipsByName = {};
+                            gltf.animations.forEach(c => clipsByName[c.name.toLowerCase()] = c);
+
+                            const walkDefaultClip = gltf.animations.find(c => c.name === 'Mammals|walk_A1');
+                            const walkStartClip = gltf.animations.find(c => c.name === 'Mammals|walk_start_A');
+                            const walkEndClip   = gltf.animations.find(c => c.name === 'Mammals|walk_end_A');
+                            const idleClip      = gltf.animations.find(c => c.name === 'Mammals|idle_A3');
+
+                            ratAnimations.walkDefault = walkDefaultClip ? mixer.clipAction(walkDefaultClip) : null;
+                            ratAnimations.walkStart   = walkStartClip   ? mixer.clipAction(walkStartClip)   : null;
+                            ratAnimations.walkEnd     = walkEndClip     ? mixer.clipAction(walkEndClip)     : null;
+                            ratAnimations.idle        = idleClip        ? mixer.clipAction(idleClip)        : null;
+
+                            // Configure looping
+                            if (ratAnimations.walkDefault) ratAnimations.walkDefault.setLoop(THREE.LoopRepeat, Infinity);
+                            if (ratAnimations.walkStart)   ratAnimations.walkStart.setLoop(THREE.LoopOnce, 1).clampWhenFinished = true;
+                            if (ratAnimations.walkEnd)     ratAnimations.walkEnd.setLoop(THREE.LoopOnce, 1).clampWhenFinished = true;
+                            if (ratAnimations.idle)        ratAnimations.idle.setLoop(THREE.LoopRepeat, Infinity);
+
+                            // Make the rat animations slower
+                            const ratBaseTimeScale = 0.5; // 50% speed
+                            Object.values(ratAnimations).forEach(action => {
+                                if (action) action.setEffectiveTimeScale(ratBaseTimeScale);
+                            });
+
+                            // Play default walk
+                            stopAllRatActions();
+                            if (ratAnimations.walkDefault) ratAnimations.walkDefault.reset().play();
+                        } else if (isDoge) {
+                            // Map doge animations
+                            const clipsByName = {};
+                            gltf.animations.forEach(c => clipsByName[c.name.toLowerCase()] = c);
+
+                            const sittingClip = gltf.animations.find(c => c.name === '0|sitting_0');
+                            const playDeadClip = gltf.animations.find(c => c.name === '0|play_dead_0');
+
+                            dogeAnimations.sitting = sittingClip ? mixer.clipAction(sittingClip) : null;
+                            dogeAnimations.playDead = playDeadClip ? mixer.clipAction(playDeadClip) : null;
+
+                            // Configure looping
+                            if (dogeAnimations.sitting) dogeAnimations.sitting.setLoop(THREE.LoopRepeat, Infinity);
+                            if (dogeAnimations.playDead) dogeAnimations.playDead.setLoop(THREE.LoopOnce, 1).clampWhenFinished = true;
+
+                            // Play default sitting animation
+                            if (dogeAnimations.sitting) dogeAnimations.sitting.reset().play();
+                        } else if (isCat) {
+                            const spinClip = gltf.animations.find(clip => clip.name === 'Take 001');
+                            if (spinClip) {
+                                catAnimations.spin = mixer.clipAction(spinClip);
+                                catAnimations.spin.setLoop(THREE.LoopRepeat, Infinity);
+                                // Do not play by default, will be triggered by pointer hover
+                            }
+                        } else if (isFidgetSpinner) {
+                            const spinClip = gltf.animations.find(clip => clip.name === 'Spin');
+                            if (spinClip) {
+                                fidgetSpinnerAnimations.spin = mixer.clipAction(spinClip);
+                                fidgetSpinnerAnimations.spin.setLoop(THREE.LoopRepeat, Infinity);
+                                // Do not play by default, will be triggered by pointer hover
+                            }
+                        }
+                    }
+                }, undefined, (err) => console.error(`${name} GLB load error:`, err));
+            }
+
+            const customChars = " .'`^\",:;Il!i~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$".slice(0, baseCharacterDensity); // Adjustable character density
+            
+            // Create ASCII effect with duck-themed colors
+            effect = new AsciiEffect(renderer, customChars, { invert: true });
+            effect.domElement.style.color = 'black'; // Black duck in light mode
+            effect.domElement.style.backgroundColor = 'white';
+            effect.domElement.style.fontWeight = '900';
+            effect.domElement.style.fontFamily = 'Geist, monospace';
+            effect.domElement.style.fontSize = '20px'; // Slightly smaller font size for tighter density
+            effect.domElement.style.textShadow = 'none';
+            effect.domElement.style.position = 'absolute';
+            effect.domElement.style.top = '50%';
+            effect.domElement.style.left = '50%';
+            effect.domElement.style.transformOrigin = 'center center';
+            // initial translate to centre combined with scale applied later
+
+            canvasContainer = document.createElement('div');
+            canvasContainer.id = 'canvasContainer';
+            canvasContainer.style.width = canvasWidth + 'px';
+            canvasContainer.style.height = canvasHeight + 'px';
+            document.body.appendChild(canvasContainer);
+            
+            canvasContainer.appendChild(effect.domElement);
+            updateAsciiScale();
+
+            // Create a canvas for drawing hands over the scene
+            handsCanvas = document.createElement('canvas');
+            handsCanvas.width = canvasWidth;
+            handsCanvas.height = canvasHeight;
+            handsCanvas.style.position = 'absolute';
+            handsCanvas.style.top = '0';
+            handsCanvas.style.left = '0';
+            handsCanvas.style.pointerEvents = 'none'; // so it doesn't block orbit controls
+            canvasContainer.appendChild(handsCanvas);
+            handsCanvasCtx = handsCanvas.getContext('2d');
+            
+            // Corner labels
+            const tl = document.createElement('div');
+            tl.className = 'corner-label top-left';
+            tl.textContent = 'ASCII';
+
+            const tr = document.createElement('div');
+            tr.className = 'corner-label top-right';
+            tr.textContent = '•';
+            tr.style.cursor = 'pointer'; // Make it look clickable
+            tr.style.userSelect = 'none'; // Prevent text selection
+            tr.style.pointerEvents = 'auto'; // Ensure clicks are captured
+            tr.addEventListener('click', toggleTheme);
+
+            bottomLeftClock = document.createElement('div');
+            bottomLeftClock.className = 'corner-label bottom-left';
+            bottomLeftClock.innerHTML = '<b>Controls:</b><br>Rotate: Right Pinch<br>Zoom: Both Pinches<br>Density: Left Pinch<br>Poke: Right Pointer Jab<br>Models: ◀ ▶';
+
+            const modelContainer = document.createElement('div');
+            modelContainer.className = 'corner-label bottom-right';
+            modelContainer.style.display = 'flex';
+            modelContainer.style.alignItems = 'center';
+            modelContainer.style.gap = '6px';
+            modelContainer.style.pointerEvents = 'auto'; // Ensure clicks are captured
+
+            const arrowLeft = document.createElement('span');
+            arrowLeft.textContent = '◀';
+            arrowLeft.style.cursor = 'pointer';
+            arrowLeft.style.pointerEvents = 'auto';
+            arrowLeft.style.userSelect = 'none';
+
+            const modelLabel = document.createElement('span');
+            modelLabel.textContent = currentModelName.charAt(0).toUpperCase() + currentModelName.slice(1);
+            modelLabel.style.pointerEvents = 'auto';
+            modelLabel.style.userSelect = 'none';
+
+            const arrowRight = document.createElement('span');
+            arrowRight.textContent = '▶';
+            arrowRight.style.cursor = 'pointer';
+            arrowRight.style.pointerEvents = 'auto';
+            arrowRight.style.userSelect = 'none';
+
+            function switchModel(offset) {
+                currentModelIndex = (currentModelIndex + offset + modelNames.length) % modelNames.length;
+                currentModelName = modelNames[currentModelIndex];
+                loadModel(currentModelName);
+                modelLabel.textContent = currentModelName.charAt(0).toUpperCase() + currentModelName.slice(1);
+            }
+
+            arrowLeft.addEventListener('click', () => switchModel(-1));
+            arrowRight.addEventListener('click', () => switchModel(1));
+
+            modelContainer.appendChild(arrowLeft);
+            modelContainer.appendChild(modelLabel);
+            modelContainer.appendChild(arrowRight);
+            canvasContainer.appendChild(tl);
+            canvasContainer.appendChild(tr);
+            canvasContainer.appendChild(bottomLeftClock);
+            canvasContainer.appendChild(modelContainer);
+
+            controls = new OrbitControls(camera, effect.domElement);
+            controls.autoRotate = true; // enable continuous rotation
+            controls.autoRotateSpeed = baseRotationSpeed;
+            controls.enableDamping = true;
+            // Pass controls and camera to hand tracking module now that they are initialized
+            setThreeJsObjects(controls, camera);
+            controls.enablePan = false;
+            controls.enableRotate = true;
+            controls.rotateSpeed = 0.8;
+            controls.minDistance = 250;
+            controls.maxDistance = 3000;
+            controls.minPolarAngle = Math.PI / 2;
+            controls.maxPolarAngle = Math.PI / 2;
+            controls.target.set(0, 0, 0);
+            window.addEventListener('resize', onWindowResize);
+            toggleTheme(); // Set initial theme to dark
+        }
+
+        function onWindowResize() {
+            const maxWidth = window.innerWidth * 0.95;
+            const maxHeight = window.innerHeight * 0.8;
+            let newWidth = Math.min(maxWidth, maxHeight * 2);
+            let newHeight = newWidth / 2;
+            if (newHeight > maxHeight) {
+                newHeight = maxHeight;
+                newWidth = newHeight * 2;
+            }
+            camera.aspect = newWidth / newHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(newWidth, newHeight);
+            if (canvasContainer) {
+                canvasContainer.style.width = newWidth + 'px';
+                canvasContainer.style.height = newHeight + 'px';
+            }
+            if (handsCanvas) {
+                handsCanvas.width = newWidth;
+                handsCanvas.height = newHeight;
+            }
+            updateAsciiScale();
+        }
+
+        function animate() {
+            let delta = clock.getDelta();
+            delta = Math.min(delta, 0.033);
+            if (mixer) mixer.update(delta);
+
+            if (pokeState.active && eyeModel && eyeModel.originalPosition) {
+                const elapsed = Date.now() - pokeState.time;
+                if (elapsed > pokeState.duration) {
+                    pokeState.active = false;
+                    eyeModel.position.copy(eyeModel.originalPosition);
+                } else {
+                    const shakeAmount = 8; // Adjust for more/less shake
+                    const progress = elapsed / pokeState.duration;
+                    const currentShake = shakeAmount * Math.sin(progress * Math.PI);
+                    eyeModel.position.x = eyeModel.originalPosition.x + (Math.random() - 0.5) * currentShake;
+                    eyeModel.position.y = eyeModel.originalPosition.y + (Math.random() - 0.5) * currentShake;
+                }
+            }
+            
+            // Adjust animation speed based on pointer proximity
+            if (mixer) {
+                if (currentModelName === 'duck') {
+                    const speed = pointerOnModel ? pointerSpeedMultiplier : 0.3; // Slower default speed
+                    if (duckAnimations.walk) duckAnimations.walk.setEffectiveTimeScale(speed);
+                }
+                // mixer.update(delta); // This is a duplicate call, remove it
+            }
+            if (currentModelName === 'frog') {
+                updateJumpAnimation();
+            }
+
+            controls.update();
+            effect.render(scene, camera);
+        }
+
+        function toggleTheme() {
+            console.log('Dot clicked!'); // Debug log
+            const isDark = document.body.style.background === 'black';
+            
+            if (isDark) {
+                // Switch to light theme - Black duck
+                document.body.style.background = 'white';
+                effect.domElement.style.color = 'black';
+                effect.domElement.style.backgroundColor = 'white';
+                document.querySelectorAll('.corner-label').forEach(label => {
+                    label.style.color = 'black';
+                });
+            } else {
+                // Switch to dark theme - White duck
+                document.body.style.background = 'black';
+                effect.domElement.style.color = 'white';
+                effect.domElement.style.backgroundColor = 'black';
+                document.querySelectorAll('.corner-label').forEach(label => {
+                    label.style.color = 'white';
+                });
+            }
+        }
+
+        function ratPointerEnter() {
+            if (!ratAnimations.walkEnd) return;
+            stopAllRatActions();
+            const endAction = ratAnimations.walkEnd;
+            const idleAction = ratAnimations.idle;
+            endAction.reset().play();
+            const duration = endAction.getClip().duration * 1000;
+            // After walkEnd finishes, play idle looping as long as pointer still on
+            setTimeout(() => {
+                if (pointerOnModel && currentModelName === 'rat' && idleAction) {
+                    stopAllRatActions();
+                    idleAction.reset().play();
+                }
+            }, duration + 50);
+        }
+
+        function ratPointerLeave() {
+            if (!ratAnimations.walkStart) {
+                // Fallback to default walk directly
+                if (ratAnimations.walkDefault) {
+                    stopAllRatActions();
+                    ratAnimations.walkDefault.reset().play();
+                }
+                return;
+            }
+            stopAllRatActions();
+            const startAction = ratAnimations.walkStart;
+            const walkDefaultAction = ratAnimations.walkDefault;
+            startAction.reset().play();
+            const duration = startAction.getClip().duration * 1000;
+            setTimeout(() => {
+                if (!pointerOnModel && currentModelName === 'rat' && walkDefaultAction) {
+                    stopAllRatActions();
+                    walkDefaultAction.reset().play();
+                }
+            }, duration + 50);
+        }
+        function startCatColorChange() {
+            if (catColorInterval) return;
+            const colors = ['#ff80ed', '#06b6d4', '#d946ef', '#fde047', '#4ade80', '#fb923c'];
+            const changeColor = () => {
+                if (effect) {
+                    const randomColor = colors[Math.floor(Math.random() * colors.length)];
+                    effect.domElement.style.color = randomColor;
+                }
+            };
+            changeColor(); // Change color immediately
+            catColorInterval = setInterval(changeColor, 1000);
+        }
+        function stopCatColorChange() {
+            if (catColorInterval) {
+                clearInterval(catColorInterval);
+                catColorInterval = null;
+            }
+            if (effect) {
+                // Reset to theme color
+                const isDark = document.body.style.background === 'black';
+                effect.domElement.style.color = isDark ? 'white' : 'black';
+            }
+        }
+    </script>
+	<script src="https://storage.googleapis.com/rosebud_staticfiles/ScriptsLoader-Universal.js"></script>	</body>
+</html>
